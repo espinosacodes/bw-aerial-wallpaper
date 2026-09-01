@@ -1,0 +1,6 @@
+# Media and generated clips (.mov) are copyrighted by Apple and intentionally
+# excluded. This repo only holds the conversion script and documentation.
+*.mov
+*.bmp
+*.png
+*.mp4
