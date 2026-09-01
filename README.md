@@ -14,6 +14,24 @@ both:
    the Aerial player still recognizes it).
 2. The poster BMPs the desktop actually draws.
 
+## The lock-screen gotcha (why it can go black)
+
+Apple's lock-screen decoder only renders an Aerial clip that carries the exact
+`colr` color atom Apple ships: `nclc primaries=1, transfer=13, matrix=1`
+(sRGB). When you re-encode with `ffmpeg` using VideoToolbox (or the mov muxer),
+it writes `transfer=1` (bt709) instead. The result plays on the desktop but the
+lock screen renders **black** the moment you lock.
+
+The script patches the `colr` atom back to `transfer=13` (sRGB) in the finished
+`.mov`, which restores the lock screen. Verify with:
+
+```bash
+ffprobe -v error -show_entries stream=color_transfer,color_primaries \
+  -of default=noprint_wrappers=1 ~/Library/Application\ Support/com.apple.wallpaper/aerials/videos/<ASSET_ID>.mov
+```
+
+It should report `color_transfer=iec61966-2-1`.
+
 ## Requirements
 
 - macOS Sonoma+
@@ -49,7 +67,13 @@ The video lives in:
 The desktop poster frames live in the agent cache:
 `~/Library/Containers/com.apple.wallpaper.agent/.../extension-com.apple.wallpaper.extension.aerials/*.bmp`
 
-The script desaturates both locations and restarts `WallpaperAgent`.
+The script:
+
+1. Backs up the original.
+2. Encodes grayscale (native fps + 10-bit HEVC, `hue=s=0`).
+3. Patches the `colr` atom back to Apple's sRGB value so the lock screen works.
+4. Desaturates the desktop poster BMPs.
+5. Swaps the files in and restarts `WallpaperAgent`.
 
 ## Notes and copyright
 
