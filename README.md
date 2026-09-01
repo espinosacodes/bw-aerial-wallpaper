@@ -32,6 +32,19 @@ ffprobe -v error -show_entries stream=color_transfer,color_primaries \
 
 It should report `color_transfer=iec61966-2-1`.
 
+## The lock-screen freeze gotcha (why it can go still)
+
+Apple encodes Aerial clips with cinemagraph sample-group boxes (`sgpd`, `csgm`)
+and a composition-to-decode timing box (`cslg`). These tell the lock-screen
+renderer the clip is a looping animation. ffmpeg's mov muxer strips all three on
+re-encode, so without a fix the lock screen shows a single stuck frame instead of
+the moving sharks.
+
+The script copies those cinemagraph boxes back out of the original `.mov` and
+re-injects them into the re-encoded file's sample table (`stbl`), rebuilding the
+box sizes up the file. The sample data (`mdat`) is untouched, so playback is
+unchanged except for the loop declaration.
+
 ## Requirements
 
 - macOS Sonoma+
@@ -72,8 +85,9 @@ The script:
 1. Backs up the original.
 2. Encodes grayscale (native fps + 10-bit HEVC, `hue=s=0`).
 3. Patches the `colr` atom back to Apple's sRGB value so the lock screen works.
-4. Desaturates the desktop poster BMPs.
-5. Swaps the files in and restarts `WallpaperAgent`.
+4. Re-injects Apple's cinemagraph loop boxes so the lock screen animates.
+5. Desaturates the desktop poster BMPs.
+6. Swaps the files in and restarts `WallpaperAgent`.
 
 ## Notes and copyright
 
