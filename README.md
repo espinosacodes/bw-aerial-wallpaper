@@ -32,18 +32,29 @@ ffprobe -v error -show_entries stream=color_transfer,color_primaries \
 
 It should report `color_transfer=iec61966-2-1`.
 
-## The lock-screen freeze gotcha (why it can go still)
+## The lock-screen gotchas
 
-Apple encodes Aerial clips with cinemagraph sample-group boxes (`sgpd`, `csgm`)
-and a composition-to-decode timing box (`cslg`). These tell the lock-screen
-renderer the clip is a looping animation. ffmpeg's mov muxer strips all three on
-re-encode, so without a fix the lock screen shows a single stuck frame instead of
-the moving sharks.
+Two things break the lock screen when you re-encode with ffmpeg:
 
-The script copies those cinemagraph boxes back out of the original `.mov` and
-re-injects them into the re-encoded file's sample table (`stbl`), rebuilding the
-box sizes up the file. The sample data (`mdat`) is untouched, so playback is
-unchanged except for the loop declaration.
+1. **Black screen.** Apple's lock-screen decoder only renders a clip that carries
+   the exact `colr` color atom (`nclc primaries=1, transfer=13, matrix=1`, i.e.
+   sRGB). ffmpeg's mov muxer writes `transfer=1` (bt709), so the lock screen
+   renders black. The script patches the `colr` atom back to `transfer=13`.
+
+2. **Still frame.** Apple marks Aerial clips as looping animations with cinemagraph
+   sample-group boxes (`sgpd`, `csgm`) and a composition-to-decode timing box
+   (`cslg`). ffmpeg strips all of them on re-encode, so the lock screen shows one
+   stuck frame instead of the moving sharks.
+
+The script encodes with `libx265` (real B-frames + per-frame composition timing)
+and re-injects the original `sgpd`/`csgm`/`cslg` boxes back into the sample table
+(`stbl`) in Apple's order, rebuilding the box sizes up the file. The sample data
+(`mdat`) is untouched.
+
+> Note: `csgm` encodes a per-asset loop cadence tied to the original frame count.
+> It must come from the same clip's original file; copying it from a different
+> Aerial can make the lock screen render black. See below for the full-pipeline
+> options.
 
 ## Requirements
 

@@ -25,24 +25,27 @@ if [[ ! -f "$VIDEO" ]]; then
   exit 1
 fi
 
-echo "[1/5] Backing up original video..."
+echo "[1/6] Backing up original video..."
 cp -p "$VIDEO" "$TMP_DIR/orig_$ASSET_ID.mov"
 
-echo "[2/5] Encoding grayscale (native frame rate, 4K, HEVC 10-bit)..."
+echo "[2/6] Encoding grayscale (native fps, 4K, HEVC 10-bit, B-frames)..."
 # hue=s=0 desaturates. We keep the native fps and 10-bit codec so the Aerial
-# player recognizes the file.
-# CRITICAL: Apple's lock-screen decoder only renders the Aerial clips that carry
-# the exact colr color atom (nclc primaries=1, transfer=13, matrix=1, i.e. sRGB).
-# VideoToolbox and ffmpeg's mov muxer force bt709 (transfer=1), which makes the
-# lock screen render BLACK. We patch the colr atom back to Apple's value below.
-# NOTE: this takes several minutes on Apple Silicon.
+# player recognizes the file, and we use libx265 so the stream keeps real
+# B-frames and per-frame composition timing (ctts), which Apple's clips use.
+# NOTE: the VideoToolbox encoder emits no B-frames, which is why the lock
+# screen showed a still frame. This x265 encode takes a while on Apple Silicon.
 ffmpeg -y -hide_banner -loglevel error \
   -i "$VIDEO" \
   -vf "hue=s=0" \
-  -c:v hevc_videotoolbox -c:a copy -tag:v hvc1 \
+  -c:v libx265 -preset ultrafast -crf 24 -pix_fmt yuv420p10le \
+  -x265-params "bframes=8:keyint=600:min-keyint=600:rc-lookahead=10" \
+  -tag:v hvc1 -c:a copy \
   "$TMP_DIR/bw_$ASSET_ID.mov"
 
-echo "[3/5] Restoring the Apple colr color atom (prevents black lock screen)..."
+echo "[3/6] Restoring the Apple colr color atom (prevents black lock screen)..."
+# Apple's lock-screen decoder only renders clips carrying the exact colr atom
+# (nclc primaries=1, transfer=13, matrix=1, i.e. sRGB). ffmpeg forces bt709
+# (transfer=1), which makes the lock screen render BLACK. Patch it back.
 python3 - "$TMP_DIR/bw_$ASSET_ID.mov" "$TMP_DIR/bw_colrfix_$ASSET_ID.mov" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
@@ -50,7 +53,6 @@ data = bytearray(open(src, 'rb').read())
 i = data.find(b'colrnclc')
 if i == -1:
     print("WARN: no colr nclc atom found; skipping color fix"); sys.exit(0)
-# 'colr'(4) + 'nclc'(4) + primaries(2) + transfer(2) + matrix(2)
 data[i + 10] = 0   # transfer high byte -> 0
 data[i + 11] = 13  # transfer low byte -> 13 (iec61966-2-1 sRGB)
 open(dst, 'wb').write(data)
@@ -60,10 +62,12 @@ print("colr atom -> primaries=%d transfer=%d matrix=%d"
          int.from_bytes(data[i+12:i+14], 'big')))
 PY
 
-echo "[4/6] Injecting Apple's cinemagraph loop boxes (makes the lock screen animate)..."
-# ffmpeg's mov muxer strips Apple's cinemagraph sample-group boxes (sgpd/csgm/cslg).
-# Without them the lock screen renders a single stuck frame instead of the looping
-# animation. We copy those boxes from the original into the re-encoded stbl.
+echo "[4/6] Re-injecting Apple's cinemagraph loop boxes (makes the lock screen animate)..."
+# ffmpeg's mov muxer strips Apple's cinemagraph sample-group boxes (sgpd/csgm).
+# They declare the clip as a looping animation to the lock-screen renderer.
+# Copy them from the original (never re-encoded, so they are authentic) into
+# the re-encoded stbl, preserving cslg AFTER stts, then rebuild the whole box
+# chain so sizes are correct. The mdat sample data is left untouched.
 python3 - "$TMP_DIR/orig_$ASSET_ID.mov" "$TMP_DIR/bw_colrfix_$ASSET_ID.mov" "$TMP_DIR/bw_$ASSET_ID.final.mov" <<'PY'
 import sys, struct
 
@@ -102,31 +106,39 @@ def payloads(d, s, sz):
 def box(typ, payload):
     return struct.pack('>I4s', 8 + len(payload), typ.encode()) + payload
 
+def ordered(payload, keep):
+    return b''.join(box(t, payload[t]) for t in keep if t in payload)
+
 orig, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
 o, g = open(orig, 'rb').read(), open(src, 'rb').read()
 
-# Apple cinemagraph boxes from the original's stbl (loop metadata, not frame order)
 oi = stbl(o); oc = payloads(o, oi['stbl'], oi['stblsz'])
-cinema = b''.join(oc[t] for t in ('sgpd', 'csgm', 'cslg') if t in oc)
+cinema = b''.join(oc[t] for t in ('sgpd', 'csgm') if t in oc)
 if not cinema:
     print("WARN: no cinemagraph boxes found; skipping injection"); open(dst, 'wb').write(g); sys.exit(0)
 
 gi = stbl(g); gb = payloads(g, gi['stbl'], gi['stblsz'])
-new_stbl = gb['stsd'] + cinema + gb['stts'] + gb['stss'] + gb['stsc'] + gb['stsz'] + gb['stco']
+# Apple's stbl order: stsd, sgpd..sgpd, csgm..csgm, stts, ctts, cslg, stss, sdtp, stsc, stsz, stco
+new_stbl = gb['stsd'] + cinema + gb['stts']
+if 'ctts' in gb:
+    new_stbl += gb['ctts']
+new_stbl += oc.get('cslg', b'')          # cslg after stts/ctts, per Apple's order
+new_stbl += gb.get('stss', b'')
+for t in ('stsc', 'stsz', 'stco'):
+    if t in gb:
+        new_stbl += gb[t]
 stbl_box = box('stbl', new_stbl)
 
 mp = payloads(g, gi['minf'], gi['minfsz'])
-minf_box = box('minf', b''.join(box(t, mp[t]) for t in ('vmhd', 'hdlr', 'dinf')) + stbl_box)
+minf_box = box('minf', ordered(mp, ('vmhd', 'hdlr', 'dinf')) + stbl_box)
 mdp = payloads(g, gi['mdia'], gi['mdiasz'])
-mdia_box = box('mdia', b''.join(box(t, mdp[t]) for t in ('mdhd', 'hdlr')) + minf_box)
+mdia_box = box('mdia', ordered(mdp, ('mdhd', 'hdlr')) + minf_box)
 tp = payloads(g, gi['trak'], gi['traksz'])
-trak_box = box('trak', b''.join(box(t, tp[t]) for t in ('tkhd', 'edts')) + mdia_box)
+trak_box = box('trak', ordered(tp, ('tkhd', 'edts')) + mdia_box)
 mop = payloads(g, gi['moov'], gi['moovsz'])
-
-def ordered(payload, keep):
-    return b''.join(box(t, payload[t]) for t in keep if t in payload)
 moov_box = box('moov', ordered(mop, ('mvhd',)) + trak_box + ordered(mop, ('udta',)))
 
+# The first 28 bytes are ftyp(20) + wide(8); mdat follows, then moov.
 out = g[:28] + g[28:28 + 8 + struct.unpack('>I', g[24:28])[0]] + moov_box
 open(dst, 'wb').write(out)
 print("injected cinemagraph boxes (%d bytes); wrote %s" % (len(cinema), dst))
