@@ -28,18 +28,13 @@ fi
 echo "[1/6] Backing up original video..."
 cp -p "$VIDEO" "$TMP_DIR/orig_$ASSET_ID.mov"
 
-echo "[2/6] Encoding grayscale (native fps, 4K, HEVC 10-bit, B-frames)..."
+echo "[2/6] Encoding grayscale (native fps, 4K, HEVC 10-bit)..."
 # hue=s=0 desaturates. We keep the native fps and 10-bit codec so the Aerial
-# player recognizes the file, and we use libx265 so the stream keeps real
-# B-frames and per-frame composition timing (ctts), which Apple's clips use.
-# NOTE: the VideoToolbox encoder emits no B-frames, which is why the lock
-# screen showed a still frame. This x265 encode takes a while on Apple Silicon.
+# player recognizes the file. NOTE: takes several minutes on Apple Silicon.
 ffmpeg -y -hide_banner -loglevel error \
   -i "$VIDEO" \
   -vf "hue=s=0" \
-  -c:v libx265 -preset ultrafast -crf 24 -pix_fmt yuv420p10le \
-  -x265-params "bframes=8:keyint=600:min-keyint=600:rc-lookahead=10" \
-  -tag:v hvc1 -c:a copy \
+  -c:v hevc_videotoolbox -c:a copy -tag:v hvc1 \
   "$TMP_DIR/bw_$ASSET_ID.mov"
 
 echo "[3/6] Restoring the Apple colr color atom (prevents black lock screen)..."
@@ -112,8 +107,24 @@ def ordered(payload, keep):
 orig, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
 o, g = open(orig, 'rb').read(), open(src, 'rb').read()
 
-oi = stbl(o); oc = payloads(o, oi['stbl'], oi['stblsz'])
-cinema = b''.join(oc[t] for t in ('sgpd', 'csgm') if t in oc)
+def children_raw(d, s, e):
+    import struct
+    p, res = s, []
+    while p + 8 <= e:
+        sz, typ = struct.unpack('>I4s', d[p:p+8]); typ = typ.decode('latin1')
+        hdr, full = 8, sz
+        if sz == 1:
+            full = struct.unpack('>Q', d[p+8:p+16])[0]; hdr = 16
+        if sz == 0:
+            full = e - p
+        res.append((typ, p, full)); p += full
+    return res
+
+oi = stbl(o)
+# Use raw children iteration to preserve duplicate sgpd/csgm boxes (payloads dict loses duplicates)
+oc_children = children(o, oi['stbl']+8, oi['stbl']+oi['stblsz'])
+cinema = b''.join(o[p:p+f] for t, p, f in oc_children if t in ('sgpd', 'csgm'))
+cslg_raw = b''.join(o[p:p+f] for t, p, f in oc_children if t == 'cslg')
 if not cinema:
     print("WARN: no cinemagraph boxes found; skipping injection"); open(dst, 'wb').write(g); sys.exit(0)
 
@@ -122,7 +133,7 @@ gi = stbl(g); gb = payloads(g, gi['stbl'], gi['stblsz'])
 new_stbl = gb['stsd'] + cinema + gb['stts']
 if 'ctts' in gb:
     new_stbl += gb['ctts']
-new_stbl += oc.get('cslg', b'')          # cslg after stts/ctts, per Apple's order
+new_stbl += cslg_raw
 new_stbl += gb.get('stss', b'')
 for t in ('stsc', 'stsz', 'stco'):
     if t in gb:
